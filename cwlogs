@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+# -*- mode: python; tab-width: 4; indent-tabs-mode: nil -*- for emacs
+
+import argparse
+import boto3
+import datetime
+import json
+import re
+import sys
+from time import ctime
+
+def parse_options():
+    parser = argparse.ArgumentParser(
+        description='Browsing CloudWatch Logs'
+    )
+    parser.add_argument('-d', '--debug',
+                        help="Enable debug output",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('-v', '--verbose',
+                        help="Enable verbose output",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('-n', '--dryrun',
+                        help="Request dryrun (noop) mode",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('-r', '--region',
+                        help="Provide a non-default AWS region")
+    parser.add_argument('-p', '--profile',
+                        help="Provide a non-default AWS profile")
+
+    parser.add_argument('-l', '--list',
+                        help="List the available Log Groups",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('-t', '--tail',
+                        help="Show the last few events of a specific Log Group")
+
+    parser.add_argument('-e', '--events',
+                        help="Limit the number of events per log group",
+                        default=10, type=int)
+    parser.add_argument('--noise',
+                        help="Suppress noisy events (typically from Lambdas)",
+                        default=False,
+                        action='store_true')
+    opts = parser.parse_args()
+
+    # Any post-processing, like checking mutually exclusive options, mandatory
+    # options, happens here.
+
+    if opts.list and opts.tail:
+        print("The options --list and --group are mutually exclusive. Pick one!")
+        sys.exit(1)
+
+    return opts
+
+def fetch_log_events(logs, group, stream, limit, noise):
+    lines = []
+    events = 0
+    # print(f"Checking events for {group} -> {stream}:")
+    token = None
+    while True:
+        next_token = {}
+        if token:
+            next_token['nextToken'] = token
+        event_response = logs.get_log_events(
+            logGroupName=group,
+            logStreamName=stream,
+            startFromHead=True,
+            **next_token)
+        # print(event_response)
+        if 'events' not in event_response:
+            # Be sure to return what we already collected, if anything.
+            return events, lines
+        last_timestamp = None
+        for event in event_response['events']:
+            msg = event['message'].rstrip()
+            if noise:
+                m = re.match(r"^(INIT_START |START RequestId: |END RequestId: |REPORT RequestId: )", msg)
+                if m:
+                    # print(f"Skipping {msg}")
+                    continue
+
+            events += 1
+            timestamp = int(int(event['timestamp'])/1000)
+            lines.append([timestamp, msg])
+            if events >= limit:
+                # Reached the limit
+                return events, lines
+
+        if events < limit:
+            # Number of events returned is less than we asked for, assume there
+            # is no point in checking for more.
+            return events, lines
+
+        if 'nextForwardToken' not in event_response:
+            break
+        if not token:
+            token = event_response['nextForwardToken']
+        else:
+            if token == event_response['nextForwardToken']:
+                break
+            token = event_response['nextForwardToken']
+    return events, lines
+
+def fetch_log_streams(logs, group, limit, noise):
+    stream_response = logs.describe_log_streams(
+        logGroupName=group,
+        orderBy='LastEventTime',
+        descending=True,
+        limit=limit)
+    if 'logStreams' not in stream_response:
+        return []
+    lines = []
+    for log_stream in stream_response['logStreams']:
+        # print(f"  {log_stream['logStreamName']} -- {ctime(int(log_stream['firstEventTimestamp'] / 1000))}..{ctime(int(log_stream['lastEventTimestamp']) / 1000)} storage: {log_stream['storedBytes']}")
+        entries, newlines = fetch_log_events(logs, group, log_stream['logStreamName'], limit, noise)
+        lines = newlines + lines
+        limit -= entries
+        if limit <= 0:
+            break
+    return lines
+
+def fetch_log_groups(logs, limit, noise, group=None):
+    suffix = ""
+    if group:
+        # Is logGroupNamePattern a recent addition?
+        response = logs.describe_log_groups(
+            logGroupNamePrefix=group
+        )
+        if 'logGroups' not in response:
+            print("No such Log Group found for this profile/region.")
+            return
+        suffix = ":"
+    else:
+        response = logs.describe_log_groups()
+        if 'logGroups' not in response:
+            print("No Log Groups found for this profile/region.")
+            return
+    for log_group in response['logGroups']:
+        print(f"{log_group['logGroupName']} (Created: {ctime(int(log_group['creationTime']) / 1000)}; Retention: {log_group['retentionInDays']} days; Storage: {log_group['storedBytes']} bytes){suffix}")
+        if not group:
+            continue
+        lines = fetch_log_streams(logs, log_group['logGroupName'], limit, noise)
+        last_timestamp = None
+        for entry in lines:
+            timestamp = entry[0]
+            msg = entry[1]
+            if not last_timestamp or timestamp != last_timestamp:
+                print(f"  {ctime(timestamp)}:")
+                last_timestamp = timestamp
+            for line in msg.split("\n"):
+                print(f"    {line}")
+    return
+
+def datetime_encoder(o):
+    if isinstance(o, datetime.datetime):
+        return o.__str__()
+
+def main():
+    opts = parse_options()
+    if opts.profile:
+        if opts.region:
+            session = boto3.session.Session(profile_name=opts.profile,
+                                            region_name=opts.region)
+        else:
+            session = boto3.session.Session(profile_name=opts.profile)
+    else:
+        if opts.region:
+            session = boto3.session.Session(region_name=opts.region)
+        else:
+            session = boto3.session.Session()
+    logs = session.client('logs')
+
+    if opts.tail:
+        fetch_log_groups(logs, opts.events,  opts.noise, opts.tail)
+    elif opts.list:
+        fetch_log_groups(logs, opts.events, opts.noise)
+
+if __name__ == "__main__":
+    main()
