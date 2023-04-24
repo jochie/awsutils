@@ -2,12 +2,10 @@
 # -*- mode: python; tab-width: 4; indent-tabs-mode: nil -*- for emacs
 
 import argparse
-import boto3
-import datetime
-import json
 import re
 import sys
 from time import ctime
+import boto3
 
 def parse_options():
     parser = argparse.ArgumentParser(
@@ -73,7 +71,6 @@ def fetch_log_events(logs, group, stream, limit, noise):
         if 'events' not in event_response:
             # Be sure to return what we already collected, if anything.
             return events, lines
-        last_timestamp = None
         for event in event_response['events']:
             msg = event['message'].rstrip()
             if noise:
@@ -153,10 +150,6 @@ def fetch_log_groups(logs, limit, noise, group=None):
             for line in msg.split("\n"):
                 print(f"    {line}")
     return
-
-def datetime_encoder(o):
-    if isinstance(o, datetime.datetime):
-        return o.__str__()
 
 def main():
     opts = parse_options()
