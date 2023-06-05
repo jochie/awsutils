@@ -7,14 +7,12 @@ import sys
 from time import ctime
 import boto3
 
+
 def parse_options():
     parser = argparse.ArgumentParser(
         description='Browsing CloudWatch Logs'
     )
-    parser.add_argument('-d', '--debug',
-                        help="Enable debug output",
-                        default=False,
-                        action='store_true')
+    # Generic (AWS) options
     parser.add_argument('-v', '--verbose',
                         help="Enable verbose output",
                         default=False,
@@ -28,19 +26,31 @@ def parse_options():
     parser.add_argument('-p', '--profile',
                         help="Provide a non-default AWS profile")
 
+    # Command-specific options:
+    parser.add_argument('-d', '--debug',
+                        help="Enable debug output",
+                        default=0, type=int)
     parser.add_argument('-l', '--list',
                         help="List the available Log Groups",
                         default=False,
                         action='store_true')
     parser.add_argument('-t', '--tail',
                         help="Show the last few events of a specific Log Group")
-
     parser.add_argument('-e', '--events',
                         help="Limit the number of events per log group",
                         default=10, type=int)
     parser.add_argument('--noise',
                         help="Suppress noisy events (typically from Lambdas)",
                         default=False,
+                        action='store_true')
+    parser.add_argument('--group',
+                        help="Group the events by date/time.",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--grep',
+                        help="Show only the groups or events that match the provided pattern.")
+    parser.add_argument('--reverse',
+                        help="Traverse the logs explicitly in reverse (appears to be sub-optimal)",
                         action='store_true')
     opts = parser.parse_args()
 
@@ -53,103 +63,164 @@ def parse_options():
 
     return opts
 
-def fetch_log_events(logs, group, stream, limit, noise):
+
+def fetch_log_events(logs, opts, stream, limit):
+    queries = 0
     lines = []
     events = 0
-    # print(f"Checking events for {group} -> {stream}:")
     token = None
     while True:
         next_token = {}
         if token:
             next_token['nextToken'] = token
+        if opts.debug > 1:
+            print(f"logs.get_log_events(logGroupName={opts.tail}, logStreamName={stream}, startFromHead={not opts.reverse}, {next_token})")
+        queries += 1
         event_response = logs.get_log_events(
-            logGroupName=group,
+            logGroupName=opts.tail,
             logStreamName=stream,
-            startFromHead=True,
+            startFromHead=not opts.reverse,
             **next_token)
-        # print(event_response)
         if 'events' not in event_response:
             # Be sure to return what we already collected, if anything.
-            return events, lines
-        for event in event_response['events']:
+            lines.reverse()
+            return events, lines, queries
+        if opts.debug > 2:
+            print(f"  Returned {event_response}")
+        event_list = event_response['events']
+        if opts.reverse:
+            event_list.reverse()
+        for event in event_list:
             msg = event['message'].rstrip()
-            if noise:
+            if opts.noise:
                 m = re.match(r"^(INIT_START |START RequestId: |END RequestId: |REPORT RequestId: )", msg)
                 if m:
-                    # print(f"Skipping {msg}")
+                    continue
+
+            if opts.grep:
+                m = re.match(opts.grep, msg)
+                if not m:
                     continue
 
             events += 1
             timestamp = int(int(event['timestamp'])/1000)
             lines.append([timestamp, msg])
-            if events >= limit:
+            if opts.reverse and events >= limit:
                 # Reached the limit
-                return events, lines
+                return events, lines, queries
 
-        if events < limit:
-            # Number of events returned is less than we asked for, assume there
-            # is no point in checking for more.
-            return events, lines
-
-        if 'nextForwardToken' not in event_response:
+        tokenName = 'nextBackwardToken' if opts.reverse else 'nextForwardToken'
+        if tokenName not in event_response:
             break
         if not token:
-            token = event_response['nextForwardToken']
+            token = event_response[tokenName]
         else:
-            if token == event_response['nextForwardToken']:
+            # From https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/logs/client/get_log_events.html
+            # If you have reached the end of the stream, it returns the same token you passed in.
+            if token == event_response[tokenName]:
                 break
-            token = event_response['nextForwardToken']
-    return events, lines
+            token = event_response[tokenName]
 
-def fetch_log_streams(logs, group, limit, noise):
-    stream_response = logs.describe_log_streams(
-        logGroupName=group,
-        orderBy='LastEventTime',
-        descending=True,
-        limit=limit)
-    if 'logStreams' not in stream_response:
-        return []
+    if not opts.reverse:
+        # print(f"Lines:\n{lines}")
+        lines.reverse()
+        if events > limit:
+            # Reached the limit
+            if opts.debug > 0:
+                print(f"  Truncating lines to {limit} out of {events} entries.")
+            return limit, lines[:limit], queries
+
+    return events, lines, queries
+
+
+def fetch_log_streams(logs, opts):
     lines = []
-    for log_stream in stream_response['logStreams']:
-        # print(f"  {log_stream['logStreamName']} -- {ctime(int(log_stream['firstEventTimestamp'] / 1000))}..{ctime(int(log_stream['lastEventTimestamp']) / 1000)} storage: {log_stream['storedBytes']}")
-        entries, newlines = fetch_log_events(logs, group, log_stream['logStreamName'], limit, noise)
-        lines = newlines + lines
-        limit -= entries
-        if limit <= 0:
-            break
-    return lines
+    limit = opts.events
+    token = {}
+    queries = 0
+    while True:
+        if opts.debug > 1:
+            print(f"logs.describe_log_streams(logGroupName={opts.tail}, orderBy='LastEventTime', descending=True, {token}")
+        queries += 1
+        stream_response = logs.describe_log_streams(
+            logGroupName=opts.tail,
+            orderBy='LastEventTime',
+            descending=True,
+            **token)
+        if 'logStreams' not in stream_response:
+            return lines, queries
 
-def fetch_log_groups(logs, limit, noise, group=None):
-    suffix = ""
-    if group:
-        # Is logGroupNamePattern a recent addition?
-        response = logs.describe_log_groups(
-            logGroupNamePrefix=group
-        )
-        if 'logGroups' not in response:
-            print("No such Log Group found for this profile/region.")
-            return
-        suffix = ":"
-    else:
-        response = logs.describe_log_groups()
-        if 'logGroups' not in response:
-            print("No Log Groups found for this profile/region.")
-            return
+        for log_stream in stream_response['logStreams']:
+            entries, newlines, event_queries = fetch_log_events(logs, opts, log_stream['logStreamName'], limit)
+            lines = lines + newlines
+            queries += event_queries
+            if opts.debug > 0:
+                print(f"fetch_log_events() returned {entries} new events.")
+            limit -= entries
+            if limit <= 0:
+                return lines, queries
+
+        if 'nextToken' not in stream_response:
+            break
+        token = { 'nextToken': stream_response['nextToken'] }
+    return lines, queries
+
+
+def list_log_groups(logs, opts):
+    response = logs.describe_log_groups()
+    if 'logGroups' not in response:
+        print("No Log Groups found for this profile/region.")
+        return
     for log_group in response['logGroups']:
-        print(f"{log_group['logGroupName']} (Created: {ctime(int(log_group['creationTime']) / 1000)}; Retention: {log_group['retentionInDays']} days; Storage: {log_group['storedBytes']} bytes){suffix}")
-        if not group:
+        if opts.grep:
+            m = re.match(opts.grep, log_group['logGroupName'])
+            if not m:
+                continue
+        print(f"{log_group['logGroupName']} (Created: {ctime(int(log_group['creationTime']) / 1000)}; Retention: {log_group['retentionInDays']} days; Storage: {log_group['storedBytes']} bytes)")
+    return
+
+
+def fetch_log_group(logs, opts):
+    # Is logGroupNamePattern a recent addition?
+    response = logs.describe_log_groups(
+        logGroupNamePrefix=opts.tail
+    )
+    if 'logGroups' not in response:
+        print("No such Log Group found for this profile/region.")
+        return
+
+    for log_group in response['logGroups']:
+        if log_group['logGroupName'] != opts.tail:
+            # I used logGroupNamePrefix but only want an exact match. Did I
+            # miss some better call that I can make instead?
             continue
-        lines = fetch_log_streams(logs, log_group['logGroupName'], limit, noise)
+
+        lines, queries = fetch_log_streams(logs, opts)
         last_timestamp = None
-        for entry in lines:
+        for entry in reversed(lines):
             timestamp = entry[0]
             msg = entry[1]
-            if not last_timestamp or timestamp != last_timestamp:
-                print(f"  {ctime(timestamp)}:")
-                last_timestamp = timestamp
+            if opts.group:
+                prefix = "    "
+                if not last_timestamp or timestamp != last_timestamp:
+                    print(f"{ctime(timestamp)}:")
+                    last_timestamp = timestamp
+            else:
+                prefix = f"{ctime(timestamp)}: "
             for line in msg.split("\n"):
-                print(f"    {line}")
+                print(f"{prefix}{line}")
+        if opts.debug > 0:
+            print(f"API queries sent: {queries}")
     return
+
+
+def fetch_log_groups(logs, opts):
+    if not opts.tail:
+        list_log_groups(logs, opts)
+        return
+    fetch_log_group(logs, opts)
+    return
+
 
 def main():
     opts = parse_options()
@@ -166,10 +237,8 @@ def main():
             session = boto3.session.Session()
     logs = session.client('logs')
 
-    if opts.tail:
-        fetch_log_groups(logs, opts.events,  opts.noise, opts.tail)
-    elif opts.list:
-        fetch_log_groups(logs, opts.events, opts.noise)
+    fetch_log_groups(logs, opts)
+    return
 
 if __name__ == "__main__":
     main()
