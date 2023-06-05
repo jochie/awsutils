@@ -167,16 +167,24 @@ def fetch_log_streams(logs, opts):
 
 
 def list_log_groups(logs, opts):
-    response = logs.describe_log_groups()
-    if 'logGroups' not in response:
-        print("No Log Groups found for this profile/region.")
-        return
-    for log_group in response['logGroups']:
-        if opts.grep:
-            m = re.match(opts.grep, log_group['logGroupName'])
-            if not m:
-                continue
-        print(f"{log_group['logGroupName']} (Created: {ctime(int(log_group['creationTime']) / 1000)}; Retention: {log_group['retentionInDays']} days; Storage: {log_group['storedBytes']} bytes)")
+    token = {}
+    while True:
+        response = logs.describe_log_groups(**token)
+        if 'logGroups' not in response:
+            print("No Log Groups found for this profile/region.")
+            return
+        for log_group in response['logGroups']:
+            if opts.grep:
+                m = re.match(opts.grep, log_group['logGroupName'])
+                if not m:
+                    continue
+            retention = f"{log_group['retentionInDays']} days" if 'retentionInDays' in log_group else 'unlimited'
+            print(f"{log_group['logGroupName']} (Created: {ctime(int(log_group['creationTime']) / 1000)}; Retention: {retention}; Storage: {log_group['storedBytes']} bytes)")
+        if 'nextToken' in response:
+            token['nextToken'] = response['nextToken']
+        else:
+            break
+
     return
 
 
