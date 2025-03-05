@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# -*- mode: python; tab-width: 4; indent-tabs-mode: nil -*- for emacs
+
+# pylint: disable=import-error
+
+"""
+A utility to fetch the freetier usage information for one or more
+accounts.
+
+In case the boto3 version isn't quite new enough, we'll try and work
+with it anyway.
+"""
+
+import argparse
+import json
+import requests
+
+import botocore
+from botocore.awsrequest import AWSRequest
+from botocore.auth import SigV4Auth
+import boto3
+
+
+def parse_options():
+    """
+    Parse command line options.
+    """
+    parser = argparse.ArgumentParser(
+        description='Check the free tier usage of one or more accounts'
+    )
+    # Generic (AWS) options
+    parser.add_argument('-v', '--verbose',
+                        help="Enable verbose output",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('-n', '--dryrun',
+                        help="Request dryrun (noop) mode",
+                        default=False,
+                        action='store_true')
+    parser.add_argument('profile',
+                        nargs='+',
+                        help="Provide a non-default AWS profile")
+    parser.add_argument('-t', '--threshold',
+                        type=int,
+                        help="Only list ones whose used or forecast is over this percentage")
+    opts = parser.parse_args()
+
+    # Any post-processing, if needed
+
+    return opts
+
+
+def show_freetype(opts, alias, profile, freetype, header_seen):
+    """
+    If the actual or estimated monthly usage exceeds the threshold
+    value, show it. If the alias/profile header had not been shown
+    yet, do that first.
+
+    Returns true if something was shown.
+    """
+    usage = freetype['actualUsageAmount']
+    limit = freetype['limit']
+    estimate = freetype['forecastedUsageAmount']
+    perc_usage = 100 * usage/limit
+    perc_estimate = 100 * estimate / limit
+
+    if opts.threshold and perc_usage and opts.threshold and perc_estimate < opts.threshold:
+        return False
+
+    if not header_seen:
+        print(f"Resources exceeding the threshold on {alias} (via {profile}):")
+        print()
+
+    print(f"{freetype['description']} ({freetype['freeTierType']}):")
+    print()
+    print(f"    Used:     {usage:5.1f} [{100 * usage/limit:5.1f}%]")
+    print(f"    Forecast: {estimate:5.1f} [{100 * estimate/limit:5.1f}%]")
+    print()
+    return True
+
+
+def check_freetier(opts, profile):
+    """
+    Check the account associated with this particular profile
+    """
+    header_seen = False
+    session = boto3.session.Session(profile_name=profile,
+                                    region_name="us-east-1")
+    iam = session.client("iam")
+    aliases = iam.list_account_aliases()
+    # What if freetier isn't available yet, b/c of a too-old verison of boto3/botocore.
+    # For instance in Debian/bookworm (current "stable"):
+    # python3-boto3    1.26.27+dfsg-1
+    # python3-botocore 1.29.27+repack-1
+    freetier = None
+    try:
+        freetier = session.client("freetier")
+    except botocore.exceptions.UnknownServiceError:
+        # Freetier BOTO3 client not available for this version.
+        pass
+
+    if freetier:
+        usage = freetier.get_free_tier_usage()
+    else:
+        # Okay, we'll do it the slightly harder way, then:
+        host = "freetier.us-east-1.api.aws"
+        method = "GetFreeTierUsage"
+        url = f"https://{host}/"
+        request = AWSRequest(
+            method="POST",
+            url=url,
+            headers={
+                'Host':host,
+                'X-Amz-Target':f"AWSFreeTierService.{method}",
+                'Content-Type':'application/x-amz-json-1.0'
+            },
+            data='{}')
+        SigV4Auth(session.get_credentials(), "freetier", "us-east-1").add_auth(request)
+        result = requests.post(request.url,
+                               headers=request.headers,
+                               data=request.data)
+        usage = json.loads(result.content)
+
+    for freetype in usage['freeTierUsages']:
+        if show_freetype(opts, aliases['AccountAliases'][0], profile, freetype, header_seen):
+            header_seen = True
+
+
+def main():
+    """
+    Parse command line options, and check the account associated with
+    each profile given
+    """
+    opts = parse_options()
+
+    for profile in opts.profile:
+        check_freetier(opts, profile)
+
+    # Done
+
+
+if __name__ == "__main__":
+    main()

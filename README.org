@@ -1,0 +1,34 @@
+#+TITLE: README
+
+* =cwlogs=
+An attempt to list and view/tail the CloudWatch Logs.
+
+** Quickstart
+Run =cwlogs --help= for the complete list of options.
+
+** Background
+I wrote this to see if I could. There are quite likely faster or better ways to do this from the command line.
+
+When you add =--debug 1= the command will track some of the API calls and give a summary at the end, like this:
+#+begin_src text
+          API queries sent: 42
+#+end_src
+
+This was done because I was scratching my head about the number of calls that were needed to /walk/ the log data, which may require more calls when going in one direction than the other. This is also why there is a =--reverse= option.
+
+** Examples
+*** List the logs for an account in a particular region
+#+begin_src shell
+  cwlogs --profile test-account --region us-east-1 --list
+#+end_src
+*** Get the most recent lines from a a certain Lambda, skipping the Lambda-noise itself
+This will give you the 50 most recent lines, grouping the lines per date/time, while skipping lines with messages like =INIT_START ...=, =REPORT RequestId: ...=, etc.
+#+begin_src shell
+  cwlogs --profile test-account --region us-east-1 -t /aws/lambda/report -e 50 --noise --group
+#+end_src
+
+* =freetier=
+Check the freetier usage information of one or more accounts.
+
+** Quickstart
+Run =freetier --help= for the complete list of options.
